@@ -1,0 +1,100 @@
+VULN-RESEARCH AGENT ARCHITECTURE
+=================================
+
+  +-----------------------------+
+  | User input                  |
+  |                             |
+  | CVE-YYYY-NNNN or            |
+  | product name + version      |
+  +--------------+--------------+
+                 |
+                 v
+  +-----------------------------+
+  | Harness adapter             |
+  |                             |
+  | Agent Skill | MCP | CLI     |
+  |                             |
+  | Hermes, Claude, Codex,      |
+  | Cursor, VS Code, Gemini, CI |
+  +--------------+--------------+
+                 |
+                 v
+  +-----------------------------+
+  | Output preference gate      |
+  |                             |
+  | ASCII | Vertical | HTML |   |
+  | Plain text                  |
+  +--------------+--------------+
+                 |
+                 v
+  +-----------------------------+
+  | Input resolution            |
+  |                             |
+  | Validate CVE syntax         |
+  | Resolve product/version     |
+  | Deduplicate CVE IDs         |
+  +--------------+--------------+
+                 |
+                 v
++----------------+-------------------------------------------------------------+
+|                         Evidence collection                                  |
+|                                                                              |
+|  +----------------------+  +----------------------+  +---------------------+  |
+|  | Vulnerability facts  |  | Exploit + chatter    |  | Threat indicators   |  |
+|  |                      |  |                      |  |                     |  |
+|  | NVD API 2.0          |  | GitHub repositories  |  | GreyNoise GNQL      |  |
+|  | CVE.org CNA / ADP    |  | Reddit search RSS    |  | VirusTotal files    |  |
+|  | CISA KEV             |  | X via xurl OAuth     |  | VT comments         |  |
+|  | FIRST EPSS           |  | Web-search fallback  |  | VT IP/domain/URL    |  |
+|  +-----------+----------+  +-----------+----------+  +----------+----------+  |
+|              |                         |                        |             |
++--------------+-------------------------+------------------------+-------------+
+               |                         |                        |
+               +-------------------------+------------------------+
+                                         |
+                                         v
+  +----------------------------------------------------------------------------+
+  | Validation and normalization                                               |
+  |                                                                            |
+  | - Prefer primary CVSS and affected-version data                            |
+  | - Verify top PoC repositories; distinguish exploit, scanner, and fake repo |
+  | - Mark X web-search estimates separately from measured API activity        |
+  | - Reject GreyNoise output if the CVE field is restricted                   |
+  | - Retain only GreyNoise IPs explicitly linked to the requested CVE         |
+  | - Extract concrete public IPs and hashes from VT comments                  |
+  | - Label community claims as unverified                                     |
+  | - Deduplicate indicators and reject private/reserved IP addresses          |
+  +--------------------------------------+-------------------------------------+
+                                         |
+                                         v
+  +----------------------------------------------------------------------------+
+  | Research model                                                             |
+  |                                                                            |
+  | CVE | Name | Description | Products | Exploit | Chatter | IoCs             |
+  | App type | Authentication | Vector | CVSS | ITW exploitation              |
+  |                                                                            |
+  | Rules: exact scope, evidence qualifiers, bullets after two sentences,      |
+  |       one-line context for every IoC                                       |
+  +--------------------------------------+-------------------------------------+
+                                         |
+                     +-------------------+-------------------+
+                     |                   |                   |
+                     v                   v                   v
+       +----------------------+ +-------------------+ +--------------------+
+       | Terminal outputs     | | Shareable output  | | Machine output     |
+       |                      | |                   | |                    |
+       | ASCII comparison     | | Standalone HTML   | | JSON              |
+       | Vertical single-CVE  | | Inline CSS        | | CSV               |
+       | Plain text           | | Mobile/browser    | | MCP tool result    |
+       +----------------------+ +-------------------+ +--------------------+
+
+CREDENTIAL BOUNDARY
+===================
+
+  Repository .env (git-ignored, chmod 600)
+      GITHUB_TOKEN | NVD_API_KEY | GREYNOISE_API_KEY | VIRUSTOTAL_API_KEY
+
+  ~/.xurl (managed only by the official xurl CLI)
+      X OAuth client credentials | access token | refresh token
+
+Neither credential store is included in the exported tarball.
