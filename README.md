@@ -20,10 +20,11 @@ It is available in three forms, all using the same stdlib-only Python core (no p
 |---|---|
 | Description, CPE-affected products, CVSS | NVD API 2.0, falling back to the CVE.org CNA/CISA-ADP record for fresh CVEs |
 | ITW exploitation | CISA KEV (incl. ransomware flag), CISA-ADP SSVC `Exploitation: active` |
-| Exploit availability | GitHub (nomi-sec/PoC-in-GitHub index plus repo search), Reddit (search RSS), X (via official `xurl` CLI) |
-| Chatter level | X post count and engagement (weighted highest), Reddit post volume, GitHub repo count and stars |
-| IoCs | GreyNoise GNQL scanner IPs (key + entitlement required); VirusTotal CVE-linked file hashes, detection counts, comments, and IP/domain/URL results (key required) |
-| Extra (JSON `_evidence`) | FIRST EPSS score/percentile, CVSS vector, top PoC links, full structured GreyNoise/VT results and coverage errors |
+| Exploit availability | GitHub (nomi-sec/PoC-in-GitHub index plus repo search), Exploit-DB (GitLab CSV mirror), Reddit (search RSS), X (via official `xurl` CLI) |
+| Chatter level | X post count and engagement (weighted highest), Reddit post volume, GitHub repo count and stars, AlienVault OTX pulse count |
+| IoCs | GreyNoise GNQL scanner IPs (key + entitlement required); VirusTotal CVE-linked file hashes, detection counts, comments, and IP/domain/URL results (key required); ThreatFox malware/C2 IOCs (key required) |
+| Cross-checks | Shodan CVEDB (CVSS/EPSS/KEV, keyless) and AlienVault OTX pulse volume (keyless), both reported only as corroborating signals |
+| Extra (JSON `_evidence`) | FIRST EPSS score/percentile, CVSS vector, top PoC links, full structured GreyNoise/VT/ThreatFox/OTX/Shodan/Exploit-DB results and coverage errors |
 
 App Type, Auth and Vector come from the CVSS vector (AV/PR) plus CPE part and description keyword heuristics. Before research, the agent asks the user to choose ASCII table, vertical table, HTML file, or plain text unless the request already names a format.
 
@@ -61,8 +62,11 @@ Optional env vars:
 - `NVD_API_KEY`: 10x NVD rate limit (free key)
 - `GREYNOISE_API_KEY`: GreyNoise GNQL scanner IPs associated with the CVE (requires GNQL entitlement)
 - `VIRUSTOTAL_API_KEY`: VirusTotal file/comment/indicator search. Public keys may have less coverage than Intelligence.
+- `THREATFOX_API_KEY`: ThreatFox (abuse.ch) malware/C2 IOCs tagged with the CVE. Free account at https://auth.abuse.ch/.
 
-Without the GreyNoise or VirusTotal key, the IoCs column says `not queried` rather than incorrectly claiming no IoCs exist. Never query sensitive/private indicators in VirusTotal; queried or submitted indicators may become visible to its community.
+Exploit-DB, AlienVault OTX, and Shodan CVEDB need no key and are always queried.
+
+Without the GreyNoise, VirusTotal, or ThreatFox key, the IoCs column says `not queried` rather than incorrectly claiming no IoCs exist. Never query sensitive/private indicators in VirusTotal; queried or submitted indicators may become visible to its community.
 
 X support: install [`xurl`](https://github.com/xdevplatform/xurl) and run `xurl auth oauth2`
 yourself. Without it, X is reported as `n/a` and the agent skill falls back to web search.
@@ -81,7 +85,7 @@ For Claude Code and other Agent Skills-compatible agents, copy `skills/vuln-rese
 {
   "mcpServers": {
     "vulnresearch": { "command": "python3", "args": ["/abs/path/vuln-research-agent/mcp/vulnresearch_mcp.py"],
-                      "env": { "GITHUB_TOKEN": "", "NVD_API_KEY": "", "GREYNOISE_API_KEY": "", "VIRUSTOTAL_API_KEY": "" } }
+                      "env": { "GITHUB_TOKEN": "", "NVD_API_KEY": "", "GREYNOISE_API_KEY": "", "VIRUSTOTAL_API_KEY": "", "THREATFOX_API_KEY": "" } }
   }
 }
 ```

@@ -2,15 +2,17 @@
 """vulnresearch - CVE / product-version vulnerability research for detection engineers.
 
 Stdlib only. Sources: NVD 2.0, CISA KEV, CISA ADP SSVC (via CVE.org), FIRST EPSS,
-GitHub (repo search + nomi-sec/PoC-in-GitHub), Reddit (RSS search), X (optional, via
-`xurl` CLI if authenticated), GreyNoise, and VirusTotal (optional API key).
+GitHub (repo search + nomi-sec/PoC-in-GitHub), Exploit-DB (GitLab CSV mirror),
+Reddit (RSS search), X (optional, via `xurl` CLI if authenticated), AlienVault OTX,
+Shodan CVEDB, GreyNoise, VirusTotal, and ThreatFox (optional API keys).
 
 Usage:
   vulnresearch.py CVE-2021-44228 [CVE-...]
   vulnresearch.py --product "Apache Tomcat" --version 9.0.30 [--limit 10]
   options: --format table|markdown|json|csv   --no-social
 
-Env (optional): GITHUB_TOKEN, NVD_API_KEY, GREYNOISE_API_KEY, VIRUSTOTAL_API_KEY.
+Env (optional): GITHUB_TOKEN, NVD_API_KEY, GREYNOISE_API_KEY, VIRUSTOTAL_API_KEY,
+THREATFOX_API_KEY. AlienVault OTX and Shodan CVEDB need no key.
 """
 import argparse, csv, html as html_lib, io, ipaddress, json, math, os, re, shutil, subprocess, sys, textwrap, time
 import urllib.parse, urllib.request, urllib.error
@@ -19,16 +21,7 @@ from collections import deque
 from pathlib import Path
 
 
-def load_repo_env():
-    """Load the repository's optional .env without overriding process env.
-
-    The script lives at skills/vuln-research/scripts/vulnresearch.py, so the
-    repository root is three parents above this file. Installed standalone
-    skills simply skip this when no repository .env exists.
-    """
-    path = Path(__file__).resolve().parents[3] / ".env"
-    if not path.is_file():
-        return
+def _apply_env_file(path):
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -40,6 +33,30 @@ def load_repo_env():
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         os.environ.setdefault(key, value)
+
+
+def load_repo_env():
+    """Load an optional .env without overriding process env.
+
+    Two layouts are supported so keys work both in the development repo and
+    once installed as a Hermes skill:
+      - installed skill: <skills-dir>/<category>/vuln-research/scripts/
+        vulnresearch.py -> the skill's own directory (1 parent up) may hold
+        a user-placed .env, since there is no repository root to find there.
+      - repo checkout: skills/vuln-research/scripts/vulnresearch.py ->
+        repository root .env is 3 parents up.
+    Both are checked (skill dir first, since it's closer to where a user
+    installing the skill would actually drop a .env); neither overrides
+    variables already exported in the environment.
+    """
+    here = Path(__file__).resolve()
+    candidates = [here.parents[1] / ".env", here.parents[3] / ".env"]
+    for path in candidates:
+        try:
+            if path.is_file():
+                _apply_env_file(path)
+        except OSError:
+            continue
 
 
 load_repo_env()
@@ -652,6 +669,189 @@ def _analysis_stats(value):
     return normalized
 
 
+_EDB_CACHE_TTL = 6 * 3600
+_EDB_CSV_URL = "https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv"
+
+
+def _edb_cache_path():
+    return Path(os.environ.get("TMPDIR", "/tmp")) / "vulnresearch_edb_cache.csv"
+
+
+def exploitdb_lookup(cve):
+    """Search Exploit-DB's public CSV index (GitLab mirror) for a CVE.
+
+    No API key: Exploit-DB has no public search API, so this fetches/caches the
+    maintained files_exploits.csv (mirrors the exploitdb repo) and greps the CVE
+    tag column. Cached locally for _EDB_CACHE_TTL seconds to avoid refetching ~10MB.
+    """
+    result = {"queried": False, "hits": [], "error": None}
+    cache = _edb_cache_path()
+    body = None
+    try:
+        if cache.is_file() and time.time() - cache.stat().st_mtime < _EDB_CACHE_TTL:
+            body = cache.read_bytes()
+    except OSError:
+        body = None
+    if body is None:
+        try:
+            req = urllib.request.Request(_EDB_CSV_URL, headers={"User-Agent": UA})
+            with _URL_OPENER.open(req, timeout=40) as r:
+                body = r.read(40 * 1024 * 1024 + 1)
+            if len(body) > 40 * 1024 * 1024:
+                result["error"] = "Exploit-DB response exceeded size limit"
+                return result
+        except urllib.error.HTTPError as e:
+            result["error"] = f"Exploit-DB HTTP {e.code}"
+            return result
+        except Exception:
+            result["error"] = "Exploit-DB network error"
+            return result
+        try:
+            cache.write_bytes(body)
+        except OSError:
+            pass
+    result["queried"] = True
+    try:
+        text = body.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        needle = cve.upper()
+        for row in reader:
+            codes = (row.get("codes") or "").upper()
+            if needle not in codes.split(";") and needle not in codes:
+                continue
+            edb_id = (row.get("id") or "").strip()
+            if not edb_id.isdigit():
+                continue
+            result["hits"].append({
+                "edb_id": edb_id,
+                "title": sanitize_text((row.get("description") or "").strip())[:160],
+                "type": (row.get("type") or "").strip(),
+                "platform": (row.get("platform") or "").strip(),
+                "verified": (row.get("verified") or "") == "1",
+                "url": f"https://www.exploit-db.com/exploits/{edb_id}",
+            })
+    except (csv.Error, UnicodeDecodeError):
+        result["error"] = "Exploit-DB CSV malformed"
+        result["hits"] = []
+    return result
+
+
+def otx_pulses(cve):
+    """Return AlienVault OTX pulse count/tags for a CVE. Public endpoint, no key."""
+    result = {"queried": False, "pulse_count": 0, "tags": [], "top_pulses": [], "error": None}
+    d, error = json_result(f"https://otx.alienvault.com/api/v1/indicators/cve/{cve}/general")
+    if error:
+        result["error"] = f"OTX {error}"
+        return result
+    result["queried"] = True
+    if not isinstance(d, dict) or not isinstance(d.get("pulse_info", {}), dict):
+        result["error"] = "OTX malformed response"
+        return result
+    info = d.get("pulse_info", {})
+    pulses = info.get("pulses", [])
+    count = info.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or not isinstance(pulses, list):
+        result["error"] = "OTX malformed response"
+        return result
+    result["pulse_count"] = count
+    tags, names = set(), []
+    for p in pulses[:20]:
+        if not isinstance(p, dict):
+            continue
+        name = p.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+        for tag in p.get("tags", []) if isinstance(p.get("tags", []), list) else []:
+            if isinstance(tag, str):
+                tags.add(tag)
+    result["tags"] = sorted(tags)[:10]
+    result["top_pulses"] = names[:5]
+    return result
+
+
+def shodan_cvedb(cve):
+    """Cross-check CVSS/EPSS/KEV via Shodan's free, unauthenticated CVEDB endpoint."""
+    result = {"queried": False, "cvss": None, "epss": None, "kev": None,
+              "ransomware": None, "error": None}
+    d, error = json_result(f"https://cvedb.shodan.io/cve/{cve}")
+    if error:
+        result["error"] = f"Shodan CVEDB {error}"
+        return result
+    result["queried"] = True
+    if not isinstance(d, dict):
+        result["error"] = "Shodan CVEDB malformed response"
+        return result
+    cvss_v = d.get("cvss")
+    epss_v = d.get("epss")
+    kev_v = d.get("kev")
+    if (cvss_v is not None and (isinstance(cvss_v, bool) or not isinstance(cvss_v, (int, float)))
+            or (epss_v is not None and (isinstance(epss_v, bool) or not isinstance(epss_v, (int, float))))
+            or (kev_v is not None and not isinstance(kev_v, bool))):
+        result["error"] = "Shodan CVEDB malformed response"
+        return result
+    result["cvss"] = cvss_v
+    result["epss"] = epss_v
+    result["kev"] = kev_v
+    result["ransomware"] = d.get("ransomware_campaign") if isinstance(d.get("ransomware_campaign"), (str, type(None))) else None
+    return result
+
+
+def threatfox_iocs(cve):
+    """Search ThreatFox (abuse.ch) for C2/malware IOCs tagged with a CVE.
+
+    Requires THREATFOX_API_KEY (free signup); without it the source is skipped
+    like GreyNoise/VirusTotal rather than silently omitted.
+    """
+    result = {"queried": False, "iocs": [], "error": None}
+    key = os.environ.get("THREATFOX_API_KEY")
+    if not key:
+        result["error"] = "THREATFOX_API_KEY missing"
+        return result
+    payload = json.dumps({"query": "taginfo", "tag": cve.upper(), "limit": 50}).encode()
+    try:
+        req = urllib.request.Request(
+            "https://threatfox-api.abuse.ch/api/v1/", data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": UA, "Auth-Key": key})
+        with _URL_OPENER.open(req, timeout=25) as r:
+            body = r.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        result["error"] = f"ThreatFox HTTP {e.code}"
+        return result
+    except Exception:
+        result["error"] = "ThreatFox network error"
+        return result
+    result["queried"] = True
+    try:
+        d = json.loads(body)
+    except ValueError:
+        result["error"] = "ThreatFox returned invalid JSON"
+        return result
+    if not isinstance(d, dict):
+        result["error"] = "ThreatFox malformed response"
+        return result
+    if d.get("query_status") != "ok":
+        result["error"] = f"ThreatFox query_status={d.get('query_status')}"
+        return result
+    data = d.get("data", [])
+    if not isinstance(data, list):
+        result["error"] = "ThreatFox malformed response"
+        return result
+    for item in data[:30]:
+        if not isinstance(item, dict):
+            continue
+        ioc_value = item.get("ioc")
+        ioc_type = item.get("ioc_type")
+        if not isinstance(ioc_value, str) or not isinstance(ioc_type, str):
+            continue
+        result["iocs"].append({
+            "ioc": ioc_value, "type": ioc_type,
+            "malware": item.get("malware_printable"),
+            "confidence": item.get("confidence_level"),
+            "first_seen": item.get("first_seen"),
+        })
+    return result
+
+
 def virustotal_iocs(cve):
     """Search VirusTotal for CVE-linked file objects and community comments.
 
@@ -766,8 +966,9 @@ def comment_iocs(text):
     return found
 
 
-def ioc_summary(gn, vt):
+def ioc_summary(gn, vt, tf=None):
     """Return actual indicators only, each with a one-line source/context."""
+    tf = tf or {"queried": False, "iocs": [], "error": None}
     items, seen = [], set()
 
     def add(kind, value, context):
@@ -809,6 +1010,22 @@ def ioc_summary(gn, vt):
         add(entry.get("type", "Indicator"), entry.get("value"),
             f"VirusTotal CVE-linked {entry.get('type', 'indicator')} search result")
 
+    for entry in tf.get("iocs", [])[:15]:
+        kind_map = {"ip:port": "IPv4", "md5_hash": "MD5", "sha256_hash": "SHA-256",
+                    "sha1_hash": "SHA-1", "url": "URL", "domain": "Domain"}
+        value = entry.get("ioc")
+        kind = kind_map.get(entry.get("type"), entry.get("type") or "Indicator")
+        if kind == "IPv4" and isinstance(value, str) and ":" in value:
+            value = value.split(":", 1)[0]
+        context = "ThreatFox (abuse.ch) malware/C2 IOC tagged with the CVE"
+        if entry.get("malware"):
+            context += f"; malware={entry['malware']}"
+        if entry.get("confidence") is not None:
+            context += f"; confidence={entry['confidence']}"
+        if entry.get("first_seen"):
+            context += f"; first_seen={entry['first_seen']}"
+        add(kind, value, context)
+
     for comment in vt.get("comments", [])[:20]:
         text = comment.get("text", "")
         context = "VirusTotal community comment (unverified): " + re.sub(r"\s+", " ", text).strip()[:160]
@@ -831,6 +1048,10 @@ def ioc_summary(gn, vt):
         coverage.append("VirusTotal returned no CVE-linked IPs or hashes")
     else:
         coverage.append("VirusTotal not queried: API key required")
+    if tf.get("error"):
+        coverage.append(f"ThreatFox unavailable: {tf['error']}")
+    elif tf.get("queried"):
+        coverage.append("ThreatFox returned no CVE-tagged IOCs")
     return "No validated IoCs returned. " + "; ".join(coverage)
 
 
@@ -985,13 +1206,15 @@ def x_posts(cve):
             "exploit_mentions": mentions, "error": None}
 
 
-def chatter_level(gh, rd, xx):
+def chatter_level(gh, rd, xx, otx=None):
     """Score 0-100 -> None/Low/Medium/High/Very High. X weighted highest when available."""
     s = 0.0
     if xx is not None and (xx.get("ok") is True or "status" not in xx):
         s += min(xx["count"], 100) * 0.4 + min(xx["engagement"] / 50, 20)
     s += min(rd["count"], 50) * 0.4
     s += min(gh["count"], 40) * 0.5 + min(gh["total_stars"] / 100, 10)
+    if otx and otx.get("queried"):
+        s += min(otx.get("pulse_count", 0), 50) * 0.3
     s = min(round(s), 100)
     lvl = "None" if s == 0 else "Low" if s < 10 else "Medium" if s < 30 else "High" if s < 60 else "Very High"
     return lvl, s
@@ -1087,10 +1310,15 @@ def research(cve, social=True):
     xx = x_posts(cve) if social else None
     gn = greynoise_iocs(cve)
     vt = virustotal_iocs(cve)
+    tf = threatfox_iocs(cve)
+    edb = exploitdb_lookup(cve) if social else {"queried": False, "hits": [], "error": None}
+    otx = otx_pulses(cve)
+    sdb = shodan_cvedb(cve)
 
     name = (k or {}).get("vulnerabilityName") or fb["title"] or (desc.split(". ")[0][:90])
     exp_src = []
     if gh["count"]: exp_src.append(f"GitHub ({gh['count']} repos)")
+    if edb.get("hits"): exp_src.append(f"Exploit-DB ({len(edb['hits'])} entries)")
     if rd["exploit_posts"]: exp_src.append(f"Reddit ({len(rd['exploit_posts'])} PoC posts)")
     if xx and (xx.get("ok") is True or "status" not in xx) and xx["exploit_mentions"]:
         exp_src.append(f"X ({len(xx['exploit_mentions'])} PoC posts)")
@@ -1098,10 +1326,19 @@ def research(cve, social=True):
         exploit = "Not queried - social/exploit sources disabled (--no-social)"
     elif exp_src:
         exploit = "Yes - " + ", ".join(exp_src)
+        unavailable = []
         if gh.get("error"):
-            exploit += f"; GitHub coverage unavailable: {gh['error']}"
-    elif gh.get("error"):
-        exploit = f"Unknown - GitHub unavailable: {gh['error']}"
+            unavailable.append(f"GitHub coverage unavailable: {gh['error']}")
+        if edb.get("error"):
+            unavailable.append(f"Exploit-DB coverage unavailable: {edb['error']}")
+        if unavailable:
+            exploit += "; " + "; ".join(unavailable)
+    elif gh.get("error") or edb.get("error"):
+        reasons = [x for x in (
+            f"GitHub unavailable: {gh['error']}" if gh.get("error") else None,
+            f"Exploit-DB unavailable: {edb['error']}" if edb.get("error") else None,
+        ) if x]
+        exploit = "Unknown - " + "; ".join(reasons)
     else:
         exploit = "No public PoC found in successfully queried sources"
 
@@ -1111,6 +1348,10 @@ def research(cve, social=True):
                        + (", ransomware use" if k.get("knownRansomwareCampaignUse") == "Known" else "") + ")")
     if (fb.get("ssvc_exploitation") or "").lower() == "active":
         itw_src.append("CISA SSVC: active")
+    if sdb.get("queried") and sdb.get("kev") and not k:
+        itw_src.append("Shodan CVEDB: KEV-flagged (cross-check; not independently confirmed in CISA KEV feed)")
+    if otx.get("queried") and otx.get("pulse_count", 0) >= 5:
+        itw_src.append(f"AlienVault OTX: {otx['pulse_count']} community pulses reference this CVE (not confirmation of ITW exploitation)")
     if itw_src:
         itw = "Yes - " + "; ".join(itw_src)
     elif kev_error or cna_error:
@@ -1152,7 +1393,7 @@ def research(cve, social=True):
             lvl, score = None, None
             chatter = "Unknown - incomplete source coverage; " + "; ".join(chatter_errors)
         else:
-            lvl, score = chatter_level(gh, rd, xx)
+            lvl, score = chatter_level(gh, rd, xx, otx)
             chatter = None
     else:
         chatter_errors = []
@@ -1162,6 +1403,8 @@ def research(cve, social=True):
     if nvd_error:
         affected_products += f"; NVD coverage unavailable: {nvd_error}"
     cvss_display = f"{cv['score']} {cv['severity'] or ''} (v{cv['version']})".strip() if cv else "Not scored"
+    if not cv and sdb.get("queried") and isinstance(sdb.get("cvss"), (int, float)):
+        cvss_display = f"{sdb['cvss']} (Shodan CVEDB cross-check; not in NVD/CVE.org)"
     if epss_error:
         cvss_display += f"; EPSS unavailable: {epss_error}"
     return {
@@ -1170,8 +1413,8 @@ def research(cve, social=True):
         "Description": desc,
         "Affected Products": affected_products,
         "Exploit Available Online": exploit,
-        "Chatter Level": chatter or f"{lvl} ({score}/100; X={x_display}, Reddit={rd['count']}, GitHub={gh['count']})",
-        "IoCs": ioc_summary(gn, vt),
+        "Chatter Level": chatter or f"{lvl} ({score}/100; X={x_display}, Reddit={rd['count']}, GitHub={gh['count']}, OTX pulses={otx.get('pulse_count', 'n/a') if otx.get('queried') else 'not queried'})",
+        "IoCs": ioc_summary(gn, vt, tf),
         "App Type": app_type(c, desc),
         "Auth": auth_req(cv, desc),
         "Vector": vector(cv),
@@ -1182,11 +1425,14 @@ def research(cve, social=True):
             "cvss_vector": (cv or {}).get("vector"), "epss": ep, "kev": k,
             "ssvc_exploitation": fb.get("ssvc_exploitation"),
             "github_top": gh["top"], "reddit_exploit_posts": rd["exploit_posts"], "reddit_recent": rd["top"],
+            "exploitdb": edb, "otx": otx, "shodan_cvedb": sdb,
             "x": xx, "x_status": x_status, "x_note": x_note, "chatter_errors": chatter_errors,
-            "greynoise": gn, "virustotal": vt,
+            "greynoise": gn, "virustotal": vt, "threatfox": tf,
             "source_errors": {"nvd": nvd_error, "cve_org": cna_error, "kev": kev_error,
                               "epss": epss_error, "github": gh.get("error"),
-                              "reddit": rd.get("error"), "x": x_error},
+                              "reddit": rd.get("error"), "x": x_error,
+                              "exploitdb": edb.get("error"), "otx": otx.get("error"),
+                              "shodan_cvedb": sdb.get("error"), "threatfox": tf.get("error")},
             "nvd_url": f"https://nvd.nist.gov/vuln/detail/{cve}",
         },
     }

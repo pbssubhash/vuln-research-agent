@@ -21,7 +21,7 @@ def load_env(path):
 
 load_env(ENV)
 print(f"Repository .env: {'present' if ENV.is_file() else 'missing (copy .env.example to .env)'}")
-for key in ("GITHUB_TOKEN", "NVD_API_KEY", "GREYNOISE_API_KEY", "VIRUSTOTAL_API_KEY"):
+for key in ("GITHUB_TOKEN", "NVD_API_KEY", "GREYNOISE_API_KEY", "VIRUSTOTAL_API_KEY", "THREATFOX_API_KEY"):
     value = os.environ.get(key, "")
     print(f"{key}: {'configured' if value else 'not configured'}")
 
