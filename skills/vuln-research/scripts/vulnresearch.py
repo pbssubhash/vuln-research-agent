@@ -2,9 +2,10 @@
 """vulnresearch - CVE / product-version vulnerability research for detection engineers.
 
 Stdlib only. Sources: NVD 2.0, CISA KEV, CISA ADP SSVC (via CVE.org), FIRST EPSS,
-GitHub (repo search + nomi-sec/PoC-in-GitHub), Exploit-DB (GitLab CSV mirror),
-Reddit (RSS search), X (optional, via `xurl` CLI if authenticated), AlienVault OTX,
-Shodan CVEDB, GreyNoise, VirusTotal, and ThreatFox (optional API keys).
+GitHub (repo search + nomi-sec/PoC-in-GitHub), GitHub Security Advisories, OSV.dev,
+Exploit-DB (GitLab CSV mirror), Reddit (RSS search), X (optional, via `xurl` CLI if
+authenticated), AlienVault OTX, Shodan CVEDB, GreyNoise, VirusTotal, and ThreatFox
+(optional API keys).
 
 Usage:
   vulnresearch.py CVE-2021-44228 [CVE-...]
@@ -852,6 +853,93 @@ def threatfox_iocs(cve):
     return result
 
 
+def osv_dev(cve):
+    """Fetch OSV.dev's record for a CVE. Keyless, no rate-limit key needed.
+
+    OSV aggregates open-source ecosystem advisories (PyPI, npm, Go, crates.io,
+    Maven, etc.) and republishes each one under its own GHSA/OSV id while also
+    indexing by CVE alias, so this covers package-manager-specific fix/affected
+    version data that NVD's CPE matching often lacks.
+    """
+    result = {"queried": False, "found": False, "severity": None, "affected": [],
+              "references": [], "aliases": [], "error": None}
+    d, error = json_result(f"https://api.osv.dev/v1/vulns/{cve}")
+    if error:
+        if error == "HTTP 404":
+            result["queried"] = True
+            return result
+        result["error"] = f"OSV.dev {error}"
+        return result
+    result["queried"] = True
+    if not isinstance(d, dict):
+        result["error"] = "OSV.dev malformed response"
+        return result
+    aliases = d.get("aliases", [])
+    if not isinstance(aliases, list) or any(not isinstance(a, str) for a in aliases):
+        result["error"] = "OSV.dev malformed response"
+        return result
+    result["found"] = True
+    result["aliases"] = aliases
+    sev = d.get("severity", [])
+    if isinstance(sev, list):
+        for s in sev:
+            if isinstance(s, dict) and isinstance(s.get("score"), str):
+                result["severity"] = s["score"]
+                break
+    affected = d.get("affected", [])
+    if isinstance(affected, list):
+        for a in affected[:8]:
+            if not isinstance(a, dict):
+                continue
+            pkg = a.get("package", {})
+            if isinstance(pkg, dict) and isinstance(pkg.get("name"), str):
+                eco = pkg.get("ecosystem", "")
+                result["affected"].append(f"{eco}:{pkg['name']}".strip(":"))
+    refs = d.get("references", [])
+    if isinstance(refs, list):
+        for r in refs[:5]:
+            if isinstance(r, dict) and isinstance(r.get("url"), str):
+                result["references"].append(r["url"])
+    return result
+
+
+def github_advisory(cve):
+    """Look up the GitHub Security Advisory (GHSA) record for a CVE.
+
+    Uses the keyless REST search (api.github.com/advisories?cve_id=...), not
+    the GraphQL API which requires a token. GITHUB_TOKEN raises the rate limit
+    if already configured for github_exploits, reused here too.
+    """
+    result = {"queried": False, "found": False, "ghsa_id": None, "severity": None,
+              "summary": None, "cwes": [], "url": None, "error": None}
+    d, error = json_result(f"https://api.github.com/advisories?cve_id={cve}", gh_headers())
+    if error:
+        result["error"] = f"GitHub Advisories {error}"
+        return result
+    result["queried"] = True
+    if not isinstance(d, list) or any(not isinstance(item, dict) for item in d):
+        result["error"] = "GitHub Advisories malformed response"
+        return result
+    if not d:
+        return result
+    item = d[0]
+    ghsa_id = item.get("ghsa_id")
+    if not isinstance(ghsa_id, str):
+        result["error"] = "GitHub Advisories malformed response"
+        return result
+    result["found"] = True
+    result["ghsa_id"] = ghsa_id
+    result["severity"] = item.get("severity") if isinstance(item.get("severity"), str) else None
+    result["summary"] = item.get("summary") if isinstance(item.get("summary"), str) else None
+    result["url"] = item.get("html_url") if isinstance(item.get("html_url"), str) else None
+    cwes = item.get("cwes", [])
+    if isinstance(cwes, list):
+        for c in cwes[:5]:
+            if isinstance(c, dict) and isinstance(c.get("cwe_id"), str):
+                result["cwes"].append(c["cwe_id"])
+    return result
+
+
 def virustotal_iocs(cve):
     """Search VirusTotal for CVE-linked file objects and community comments.
 
@@ -1314,6 +1402,8 @@ def research(cve, social=True):
     edb = exploitdb_lookup(cve) if social else {"queried": False, "hits": [], "error": None}
     otx = otx_pulses(cve)
     sdb = shodan_cvedb(cve)
+    osv = osv_dev(cve)
+    ghsa = github_advisory(cve)
 
     name = (k or {}).get("vulnerabilityName") or fb["title"] or (desc.split(". ")[0][:90])
     exp_src = []
@@ -1400,11 +1490,15 @@ def research(cve, social=True):
         lvl, score = None, None
         chatter = "Not queried - social sources disabled (--no-social)"
     affected_products = "; ".join(affected(c) if c and c.get("configurations") else fb["affected"][:6]) or "See advisory"
+    if osv.get("found") and osv.get("affected"):
+        affected_products += "; OSV.dev packages: " + ", ".join(osv["affected"][:6])
     if nvd_error:
         affected_products += f"; NVD coverage unavailable: {nvd_error}"
     cvss_display = f"{cv['score']} {cv['severity'] or ''} (v{cv['version']})".strip() if cv else "Not scored"
     if not cv and sdb.get("queried") and isinstance(sdb.get("cvss"), (int, float)):
         cvss_display = f"{sdb['cvss']} (Shodan CVEDB cross-check; not in NVD/CVE.org)"
+    if not cv and not sdb.get("cvss") and ghsa.get("found") and ghsa.get("severity"):
+        cvss_display = f"Not scored (GHSA severity: {ghsa['severity']})"
     if epss_error:
         cvss_display += f"; EPSS unavailable: {epss_error}"
     return {
@@ -1426,13 +1520,15 @@ def research(cve, social=True):
             "ssvc_exploitation": fb.get("ssvc_exploitation"),
             "github_top": gh["top"], "reddit_exploit_posts": rd["exploit_posts"], "reddit_recent": rd["top"],
             "exploitdb": edb, "otx": otx, "shodan_cvedb": sdb,
+            "osv_dev": osv, "github_advisory": ghsa,
             "x": xx, "x_status": x_status, "x_note": x_note, "chatter_errors": chatter_errors,
             "greynoise": gn, "virustotal": vt, "threatfox": tf,
             "source_errors": {"nvd": nvd_error, "cve_org": cna_error, "kev": kev_error,
                               "epss": epss_error, "github": gh.get("error"),
                               "reddit": rd.get("error"), "x": x_error,
                               "exploitdb": edb.get("error"), "otx": otx.get("error"),
-                              "shodan_cvedb": sdb.get("error"), "threatfox": tf.get("error")},
+                              "shodan_cvedb": sdb.get("error"), "threatfox": tf.get("error"),
+                              "osv_dev": osv.get("error"), "github_advisory": ghsa.get("error")},
             "nvd_url": f"https://nvd.nist.gov/vuln/detail/{cve}",
         },
     }

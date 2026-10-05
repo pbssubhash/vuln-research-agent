@@ -18,7 +18,7 @@ It is available in three forms, all using the same stdlib-only Python core (no p
 
 | Signal | Source |
 |---|---|
-| Description, CPE-affected products, CVSS | NVD API 2.0, falling back to the CVE.org CNA/CISA-ADP record for fresh CVEs |
+| Description, CPE-affected products, CVSS | NVD API 2.0, falling back to the CVE.org CNA/CISA-ADP record for fresh CVEs; OSV.dev package/ecosystem data and GitHub Security Advisory (GHSA) severity as further fallbacks |
 | ITW exploitation | CISA KEV (incl. ransomware flag), CISA-ADP SSVC `Exploitation: active` |
 | Exploit availability | GitHub (nomi-sec/PoC-in-GitHub index plus repo search), Exploit-DB (GitLab CSV mirror), Reddit (search RSS), X (via official `xurl` CLI) |
 | Chatter level | X post count and engagement (weighted highest), Reddit post volume, GitHub repo count and stars, AlienVault OTX pulse count |
@@ -64,7 +64,7 @@ Optional env vars:
 - `VIRUSTOTAL_API_KEY`: VirusTotal file/comment/indicator search. Public keys may have less coverage than Intelligence.
 - `THREATFOX_API_KEY`: ThreatFox (abuse.ch) malware/C2 IOCs tagged with the CVE. Free account at https://auth.abuse.ch/.
 
-Exploit-DB, AlienVault OTX, and Shodan CVEDB need no key and are always queried.
+Exploit-DB, AlienVault OTX, GitHub Security Advisories, OSV.dev, and Shodan CVEDB need no key and are always queried.
 
 Without the GreyNoise, VirusTotal, or ThreatFox key, the IoCs column says `not queried` rather than incorrectly claiming no IoCs exist. Never query sensitive/private indicators in VirusTotal; queried or submitted indicators may become visible to its community.
 
